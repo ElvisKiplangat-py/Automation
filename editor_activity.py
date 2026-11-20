@@ -26,6 +26,108 @@ EDITORS = (
 )
 MINIMUM_SIMULATED_KEY_DELAY_MS = 50
 
+
+def is_wsl() -> bool:
+    return "microsoft" in " ".join((os.environ.get("WSL_DISTRO_NAME", ""),
+                                     Path("/proc/version").read_text(errors="ignore")
+                                     if Path("/proc/version").exists() else "")).lower()
+
+
+class WindowsInput:
+    """Send Unicode keyboard input to the foreground Windows VS Code window."""
+
+    POWERSHELL = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinInput {
+  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public UInt32 type; public U U; }
+  [StructLayout(LayoutKind.Explicit, Size=32)] public struct U { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public UInt16 vk; public UInt16 scan; public UInt32 flags; public UInt32 time; public IntPtr extra; }
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public Int32 dx; public Int32 dy; public UInt32 data; public UInt32 flags; public UInt32 time; public IntPtr extra; }
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] i, int size);
+  public static string ActiveTitle() { var h=GetForegroundWindow(); var s=new System.Text.StringBuilder(1024); GetWindowText(h,s,s.Capacity); uint p; GetWindowThreadProcessId(h,out p); try { return System.Diagnostics.Process.GetProcessById((int)p).ProcessName+"|"+s.ToString(); } catch { return "|"+s.ToString(); } }
+  static void Check(uint sent) { if(sent!=1) throw new Exception("SendInput failed (Windows error "+Marshal.GetLastWin32Error()+")"); }
+  public static void Key(ushort vk) { var a=new INPUT[1]; a[0].type=1; a[0].U.ki.vk=vk; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); a[0].U.ki.flags=2; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); }
+  public static void Editor() { var a=new INPUT[4]; for(int n=0;n<4;n++) a[n].type=1; a[0].U.ki.vk=0x11; a[1].U.ki.vk=0x31; a[2].U.ki.vk=0x31; a[2].U.ki.flags=2; a[3].U.ki.vk=0x11; a[3].U.ki.flags=2; if(SendInput(4,a,Marshal.SizeOf(typeof(INPUT)))!=4) throw new Exception("SendInput failed (Windows error "+Marshal.GetLastWin32Error()+")"); }
+  public static void Char(char c) { var a=new INPUT[1]; a[0].type=1; a[0].U.ki.scan=c; a[0].U.ki.flags=4; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); a[0].U.ki.flags=6; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); }
+}
+"@
+while ($line = [Console]::ReadLine()) {
+  try {
+    $q = $line | ConvertFrom-Json
+    switch ($q.op) {
+      'active' { $v=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([WinInput]::ActiveTitle())); [Console]::WriteLine("OK $v") }
+      'type' { $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($q.text)); foreach($c in $s.ToCharArray()) { [WinInput]::Char($c); if($q.delay -gt 0){Start-Sleep -Milliseconds $q.delay} }; [Console]::WriteLine('OK') }
+      'key' { if($q.name -eq 'enter'){[WinInput]::Key(0x0D)} elseif($q.name -eq 'backspace'){[WinInput]::Key(0x08)} elseif($q.name -eq 'editor'){[WinInput]::Editor()}; [Console]::WriteLine('OK') }
+    }
+  } catch { [Console]::WriteLine('ERR '+$_.Exception.Message) }
+}
+'''
+
+    def __init__(self) -> None:
+        import base64
+        command = shutil.which("powershell.exe") or shutil.which("powershell")
+        if command is None:
+            raise RuntimeError("Could not find powershell.exe. Enable WSL interop to send input to Windows VS Code.")
+        self.process = subprocess.Popen(
+            [command, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(self.POWERSHELL.encode("utf-16le")).decode("ascii")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self._request({"op": "active"})
+
+    def _request(self, request: dict[str, object]) -> str:
+        import json
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self.process.stdin.write(json.dumps(request) + "\n")
+        self.process.stdin.flush()
+        response = self.process.stdout.readline().rstrip("\r\n")
+        if response.startswith("ERR ") or not response:
+            raise RuntimeError(response[4:] if response.startswith("ERR ") else "PowerShell input bridge stopped.")
+        return response[3:] if response.startswith("OK ") else ""
+
+    def active(self) -> str:
+        import base64
+        value = self._request({"op": "active"})
+        return base64.b64decode(value).decode("utf-8", errors="replace")
+
+    def require_focus(self) -> None:
+        process, title = self.active().split("|", 1)
+        if process.lower() != "code" or not title:
+            raise RuntimeError("Typing stopped because Windows VS Code lost focus. No further source text will be sent.")
+
+    def wait_for_focus(self, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.active().split("|", 1)[0].lower() == "code":
+                self.key("editor")  # VS Code: focus the editor group (Ctrl+1).
+                time.sleep(0.2)
+                return
+            time.sleep(0.25)
+        raise RuntimeError("Focus the Windows VS Code window within 30 seconds; no source text was typed.")
+
+    def type_text(self, text: str, delay_ms: int) -> None:
+        import base64
+        self._request({"op": "type", "text": base64.b64encode(text.encode("utf-8")).decode("ascii"), "delay": delay_ms})
+
+    def key(self, name: str) -> None:
+        self._request({"op": "key", "name": name})
+
+    def close(self) -> None:
+        if self.process.stdin:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+
 def create_output_file(workspace: str, source: Path, index: int) -> Path:
     """Create an unused destination path without touching any existing file."""
     folder = Path(workspace) / "replayed_code"
@@ -41,6 +143,12 @@ def create_output_file(workspace: str, source: Path, index: int) -> Path:
 
 
 def require_tools() -> None:
+    if is_wsl():
+        if shutil.which("powershell.exe") is None and shutil.which("powershell") is None:
+            raise RuntimeError("Could not find powershell.exe. Enable WSL interop to control Windows VS Code.")
+        if shutil.which("code") is None:
+            raise RuntimeError("Could not find the VS Code WSL command. Open this folder with VS Code's 'Reopen Folder in WSL' command.")
+        return
     missing = [name for name in ("wmctrl", "xdotool") if shutil.which(name) is None]
     if missing:
         raise RuntimeError(
@@ -48,7 +156,10 @@ def require_tools() -> None:
             + ". Install with: sudo apt update && sudo apt install wmctrl xdotool"
         )
     if not ("DISPLAY" in os.environ or "WAYLAND_DISPLAY" in os.environ):
-        raise RuntimeError("No graphical desktop session detected. Run this from Kali's desktop terminal.")
+        raise RuntimeError(
+            "No graphical display detected. On WSL, enable WSLg or connect to "
+            "an X server, then run this from a terminal with DISPLAY configured."
+        )
 
 
 def list_windows() -> list[tuple[str, str]]:
@@ -131,6 +242,13 @@ def wait_for_editor_focus(window_id: str, timeout: float = 10) -> None:
 
 
 def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None = None) -> str:
+    if is_wsl():
+        if editor.name != "VS Code":
+            raise RuntimeError("The Windows input bridge currently supports VS Code only; use --editor \"VS Code\".")
+        subprocess.Popen([shutil.which("code") or "code", "--reuse-window", str(file_to_open or Path(workspace))],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        print("Opened the destination through the VS Code WSL command. Focus its Windows window to begin typing.")
+        return "windows-vscode"
     window = window_for(editor)
     if window is None:
         executable = next((shutil.which(command) for command in editor.commands if shutil.which(command)), None)
@@ -160,6 +278,10 @@ def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None
 
 
 def open_file_in_editor(editor: Editor, file_path: Path) -> str:
+    if is_wsl():
+        subprocess.Popen([shutil.which("code") or "code", "--reuse-window", str(file_path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return "windows-vscode"
     executable = next((shutil.which(command) for command in editor.commands if shutil.which(command)), None)
     if executable is None:
         raise RuntimeError(f"Could not find {editor.name}. Install it or ensure its launcher is on PATH.")
@@ -189,6 +311,7 @@ def replay_source(
     max_line_pause: float, thinking_pause_chance: float,
     typo_chance: float, slowdown_factor: float,
     target_hours_per_10000_lines: float,
+    windows_input: WindowsInput | None = None,
 ) -> None:
     """Type source text into the focused destination using xdotool keystrokes."""
     content = source.read_text(encoding="utf-8")
@@ -214,7 +337,10 @@ def replay_source(
         "before occasional thinking pauses."
     )
     for line_number, line in enumerate(lines):
-        require_editor_focus(window_id)
+        if windows_input:
+            windows_input.require_focus()
+        else:
+            require_editor_focus(window_id)
         # xdotool types literal text as simulated key events. Per-line calls keep
         # indentation and punctuation intact and allow a human-like line rhythm.
         text = line.rstrip("\r\n")
@@ -236,35 +362,59 @@ def replay_source(
                 if typo_position < cursor:
                     continue
                 if typo_position > cursor:
-                    subprocess.run(
-                        ["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", text[cursor:typo_position]],
-                        check=True,
-                    )
+                    if windows_input:
+                        windows_input.type_text(text[cursor:typo_position], key_delay)
+                    else:
+                        subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", text[cursor:typo_position]], check=True)
                 correct = text[typo_position]
                 wrong = random.choice("abcdefghijklmnopqrstuvwxyz")
                 while wrong.lower() == correct.lower():
                     wrong = random.choice("abcdefghijklmnopqrstuvwxyz")
-                subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", wrong], check=True)
+                if windows_input:
+                    windows_input.type_text(wrong, key_delay)
+                else:
+                    subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", wrong], check=True)
                 time.sleep(random.uniform(0.12, 0.45) * pace * pace_scale)
-                require_editor_focus(window_id)
-                subprocess.run(["xdotool", "key", "--window", window_id, "--clearmodifiers", "BackSpace"], check=True)
+                if windows_input:
+                    windows_input.require_focus()
+                    windows_input.key("backspace")
+                else:
+                    require_editor_focus(window_id)
+                    subprocess.run(["xdotool", "key", "--window", window_id, "--clearmodifiers", "BackSpace"], check=True)
                 time.sleep(random.uniform(0.08, 0.3) * pace * pace_scale)
-                require_editor_focus(window_id)
-                subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", correct], check=True)
+                if windows_input:
+                    windows_input.require_focus()
+                    windows_input.type_text(correct, key_delay)
+                else:
+                    require_editor_focus(window_id)
+                    subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", correct], check=True)
                 cursor = typo_position + 1
             if cursor < len(text):
-                subprocess.run(
-                    ["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", text[cursor:]],
-                    check=True,
-                )
+                if windows_input:
+                    windows_input.type_text(text[cursor:], key_delay)
+                else:
+                    subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", text[cursor:]], check=True)
         if line.endswith(("\n", "\r")):
-            require_editor_focus(window_id)
-            subprocess.run(["xdotool", "key", "--window", window_id, "--clearmodifiers", "Return"], check=True)
+            if windows_input:
+                windows_input.require_focus()
+                windows_input.key("enter")
+            else:
+                require_editor_focus(window_id)
+                subprocess.run(["xdotool", "key", "--window", window_id, "--clearmodifiers", "Return"], check=True)
             pause = random.uniform(min_line_pause, max_line_pause) * pace * pace_scale
             if not text.strip():
                 pause += random.uniform(0.4, 1.2) * pace_scale
             if random.random() < thinking_pause_chance:
                 pause += random.uniform(1.0, 3.5) * pace_scale
+            # Move the pointer occasionally while the editor is idle between
+            # lines. This is limited to Linux/X11 because the Windows bridge
+            # intentionally exposes keyboard input only.
+            if not windows_input and random.random() < 0.18:
+                x, y = random_point(window_id)
+                subprocess.run(
+                    ["xdotool", "mousemove", "--sync", str(x), str(y)],
+                    stdout=subprocess.DEVNULL, check=False,
+                )
             time.sleep(pause)
     print(f"Finished typing {len(lines)} lines from {source}")
 
@@ -285,15 +435,18 @@ def activity_session(
     min_line_pause: float, max_line_pause: float,
     thinking_pause_chance: float, typo_chance: float, slowdown_factor: float,
     target_hours_per_10000_lines: float,
+    windows_input: WindowsInput | None = None,
 ) -> None:
     destination = create_output_file(workspace, source, output_index) if source else None
     window_id = launch_or_activate(editor, workspace, destination)
     if source and destination:
         window_id = open_file_in_editor(editor, destination)
+        if windows_input:
+            windows_input.wait_for_focus()
         replay_source(
             source, destination, window_id, min_key_delay_ms, max_key_delay_ms,
             min_line_pause, max_line_pause, thinking_pause_chance,
-            typo_chance, slowdown_factor, target_hours_per_10000_lines,
+            typo_chance, slowdown_factor, target_hours_per_10000_lines, windows_input,
         )
         # Code replay is confined to the selected editor and exits immediately
         # after the source is typed. Do not move/click the pointer afterward.
@@ -353,20 +506,39 @@ def main() -> int:
         print("This version targets Kali/Linux desktop sessions.", file=sys.stderr)
         return 2
     args = parse_args()
+    if is_wsl() and not args.source:
+        print("Error: WSL mode currently supports source replay only. Add --source FILE (and usually --once).", file=sys.stderr)
+        return 2
     try:
         require_tools()
-        import pyautogui
+        windows_input = WindowsInput() if is_wsl() else None
+        if not windows_input:
+            import pyautogui
     except (RuntimeError, ImportError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         if isinstance(exc, ImportError):
             print("Install Python dependencies with: python -m pip install -r requirements.txt", file=sys.stderr)
         return 2
+    except Exception as exc:
+        # pyautogui connects to X while importing (through mouseinfo), so a
+        # stale DISPLAY or missing Xauthority file otherwise produces a long
+        # traceback before the script can start.
+        print(
+            "Error: Could not connect to the X display. In WSL, this script "
+            "needs WSLg (or another X server) and a Linux GUI editor window; "
+            "Windows VS Code windows are not controlled by wmctrl/xdotool. "
+            "Check DISPLAY and XAUTHORITY for the active display.",
+            file=sys.stderr,
+        )
+        print(f"Details: {exc}", file=sys.stderr)
+        return 2
 
     if args.seed is not None:
         random.seed(args.seed)
     workspace = str(Path(args.workspace or Path.cwd()).resolve())
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.15
+    if not windows_input:
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.15
     try:
         while True:
             selected_editor = next(editor for editor in EDITORS if editor.name == args.editor)
@@ -382,6 +554,7 @@ def main() -> int:
                     args.min_line_pause, args.max_line_pause,
                     args.thinking_pause_chance, args.typo_chance,
                     args.slowdown_factor, args.target_hours_per_10000_lines,
+                    windows_input,
                 )
                 if not args.once:
                     pause = random.uniform(args.min_break, args.max_break) * 60
@@ -390,12 +563,26 @@ def main() -> int:
             if args.once:
                 break
     except KeyboardInterrupt:
+        if windows_input:
+            windows_input.close()
         print("\nStopped by user.")
-    except pyautogui.FailSafeException:
-        print("\nStopped by mouse fail-safe (move pointer to the top-left corner).")
-    except (RuntimeError, OSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    except Exception as exc:
+        if windows_input:
+            windows_input.close()
+        if not windows_input:
+            try:
+                import pyautogui
+                if isinstance(exc, pyautogui.FailSafeException):
+                    print("\nStopped by mouse fail-safe (move pointer to the top-left corner).")
+                    return 0
+            except ImportError:
+                pass
+        if isinstance(exc, (RuntimeError, OSError)):
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        raise
+    if windows_input:
+        windows_input.close()
     return 0
 
 
