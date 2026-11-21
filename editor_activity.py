@@ -38,6 +38,37 @@ class WindowsInput:
 
     POWERSHELL = r'''
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+function Invoke-ClipboardRetry([scriptblock]$Action) {
+  $lastError=$null
+  for($attempt=0; $attempt -lt 25; $attempt++) {
+    try { return (& $Action) }
+    catch { $lastError=$_.Exception; Start-Sleep -Milliseconds 80 }
+  }
+  throw "Windows clipboard stayed busy after retries: $($lastError.Message)"
+}
+function Get-ClipboardTextSafe {
+  $hasText=Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::ContainsText() }
+  if($hasText){ return Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::GetText() } }
+  return $null
+}
+function Set-ClipboardTextSafe([string]$Text) {
+  Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::SetText($Text,[System.Windows.Forms.TextDataFormat]::UnicodeText) }
+}
+$script:OriginalClipboard = Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::GetDataObject() }
+$script:BridgeOwnsClipboard = $false
+$script:LastBridgeText = $null
+function Restore-BridgeClipboard {
+  if($script:BridgeOwnsClipboard) {
+    $stillOurs=(Get-ClipboardTextSafe) -eq $script:LastBridgeText
+    if($stillOurs) {
+      if($null -ne $script:OriginalClipboard){Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::SetDataObject($script:OriginalClipboard,$true) }} else {Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::Clear() }}
+    } else {
+      $script:OriginalClipboard=Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::GetDataObject() }
+    }
+    $script:BridgeOwnsClipboard=$false
+  }
+}
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -49,12 +80,18 @@ public static class WinInput {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] i, int size);
   public static string ActiveTitle() { var h=GetForegroundWindow(); var s=new System.Text.StringBuilder(1024); GetWindowText(h,s,s.Capacity); uint p; GetWindowThreadProcessId(h,out p); try { return System.Diagnostics.Process.GetProcessById((int)p).ProcessName+"|"+s.ToString(); } catch { return "|"+s.ToString(); } }
   static void Check(uint sent) { if(sent!=1) throw new Exception("SendInput failed (Windows error "+Marshal.GetLastWin32Error()+")"); }
   public static void Key(ushort vk) { var a=new INPUT[1]; a[0].type=1; a[0].U.ki.vk=vk; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); a[0].U.ki.flags=2; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); }
   public static void Editor() { var a=new INPUT[4]; for(int n=0;n<4;n++) a[n].type=1; a[0].U.ki.vk=0x11; a[1].U.ki.vk=0x31; a[2].U.ki.vk=0x31; a[2].U.ki.flags=2; a[3].U.ki.vk=0x11; a[3].U.ki.flags=2; if(SendInput(4,a,Marshal.SizeOf(typeof(INPUT)))!=4) throw new Exception("SendInput failed (Windows error "+Marshal.GetLastWin32Error()+")"); }
   public static void Char(char c) { var a=new INPUT[1]; a[0].type=1; a[0].U.ki.scan=c; a[0].U.ki.flags=4; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); a[0].U.ki.flags=6; Check(SendInput(1,a,Marshal.SizeOf(typeof(INPUT)))); }
+  public static void MoveRandomInCodeWindow() { var h=GetForegroundWindow(); var r=new RECT(); if(!GetWindowRect(h,out r)) throw new Exception("Could not read VS Code window bounds"); var x=new Random().Next(r.Left+12,Math.Max(r.Left+13,r.Right-12)); var y=new Random().Next(r.Top+50,Math.Max(r.Top+51,r.Bottom-12)); if(!SetCursorPos(x,y)) throw new Exception("Could not move pointer"); }
+  public static void ClickActivityBar() { var h=GetForegroundWindow(); var r=new RECT(); if(!GetWindowRect(h,out r)) throw new Exception("Could not read VS Code window bounds"); var x=r.Left+24; var y=r.Top+100+(new Random().Next(0,6)*40); if(!SetCursorPos(x,y)) throw new Exception("Could not move pointer"); mouse_event(0x0002,0,0,0,UIntPtr.Zero); mouse_event(0x0004,0,0,0,UIntPtr.Zero); Editor(); }
 }
 "@
 while ($line = [Console]::ReadLine()) {
@@ -62,8 +99,42 @@ while ($line = [Console]::ReadLine()) {
     $q = $line | ConvertFrom-Json
     switch ($q.op) {
       'active' { $v=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([WinInput]::ActiveTitle())); [Console]::WriteLine("OK $v") }
-      'type' { $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($q.text)); foreach($c in $s.ToCharArray()) { [WinInput]::Char($c); if($q.delay -gt 0){Start-Sleep -Milliseconds $q.delay} }; [Console]::WriteLine('OK') }
-      'key' { if($q.name -eq 'enter'){[WinInput]::Key(0x0D)} elseif($q.name -eq 'backspace'){[WinInput]::Key(0x08)} elseif($q.name -eq 'editor'){[WinInput]::Editor()}; [Console]::WriteLine('OK') }
+      'move' { if([WinInput]::ActiveTitle().StartsWith('Code|',[StringComparison]::OrdinalIgnoreCase)){[WinInput]::MoveRandomInCodeWindow();[Console]::WriteLine('OK')}else{[Console]::WriteLine('PAUSED')} }
+      'safe_click' { if([WinInput]::ActiveTitle().StartsWith('Code|',[StringComparison]::OrdinalIgnoreCase)){[WinInput]::ClickActivityBar();[Console]::WriteLine('OK')}else{[Console]::WriteLine('PAUSED')} }
+      'type' {
+        if(-not [WinInput]::ActiveTitle().StartsWith('Code|',[StringComparison]::OrdinalIgnoreCase)) {
+          Restore-BridgeClipboard
+          [Console]::WriteLine('PAUSED')
+        } else {
+          $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($q.text))
+          $elements=[Globalization.StringInfo]::GetTextElementEnumerator($s)
+          if($elements.MoveNext()) {
+            $piece=$elements.GetTextElement()
+            if($script:BridgeOwnsClipboard) {
+              $stillOurs=(Get-ClipboardTextSafe) -eq $script:LastBridgeText
+              if(-not $stillOurs) {$script:OriginalClipboard=Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::GetDataObject() }; $script:BridgeOwnsClipboard=$false}
+            }
+            if(-not $script:BridgeOwnsClipboard) {$script:OriginalClipboard=Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::GetDataObject() }}
+            if($piece -eq "`n") {$piece="`r`n"}
+            Set-ClipboardTextSafe $piece
+            $script:LastBridgeText=$piece
+            $script:BridgeOwnsClipboard=$true
+            if(-not [WinInput]::ActiveTitle().StartsWith('Code|',[StringComparison]::OrdinalIgnoreCase)) {Restore-BridgeClipboard; [Console]::WriteLine('PAUSED')}
+            else {[System.Windows.Forms.SendKeys]::SendWait('^v'); if($q.delay -gt 0){Start-Sleep -Milliseconds ([int]$q.delay)}; [Console]::WriteLine('OK')}
+          } else {[Console]::WriteLine('OK')}
+        }
+      }
+      'key' {
+        if($q.name -eq 'enter') {
+          if(-not $script:BridgeOwnsClipboard) {$script:OriginalClipboard=Invoke-ClipboardRetry { [System.Windows.Forms.Clipboard]::GetDataObject() }}
+          Set-ClipboardTextSafe "`r`n"
+          $script:LastBridgeText="`r`n"
+          $script:BridgeOwnsClipboard=$true
+          [System.Windows.Forms.SendKeys]::SendWait('^v')
+        } elseif($q.name -eq 'backspace') {[WinInput]::Key(0x08)} elseif($q.name -eq 'editor'){[WinInput]::Editor()} elseif($q.name -eq 'save'){[System.Windows.Forms.SendKeys]::SendWait('^s')}
+        [Console]::WriteLine('OK')
+      }
+      'restore' {Restore-BridgeClipboard; [Console]::WriteLine('OK')}
     }
   } catch { [Console]::WriteLine('ERR '+$_.Exception.Message) }
 }
@@ -75,7 +146,7 @@ while ($line = [Console]::ReadLine()) {
         if command is None:
             raise RuntimeError("Could not find powershell.exe. Enable WSL interop to send input to Windows VS Code.")
         self.process = subprocess.Popen(
-            [command, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+            [command, "-NoLogo", "-NoProfile", "-NonInteractive", "-Sta", "-EncodedCommand",
              base64.b64encode(self.POWERSHELL.encode("utf-16le")).decode("ascii")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -91,6 +162,8 @@ while ($line = [Console]::ReadLine()) {
         response = self.process.stdout.readline().rstrip("\r\n")
         if response.startswith("ERR ") or not response:
             raise RuntimeError(response[4:] if response.startswith("ERR ") else "PowerShell input bridge stopped.")
+        if response in ("OK", "PAUSED"):
+            return response
         return response[3:] if response.startswith("OK ") else ""
 
     def active(self) -> str:
@@ -103,6 +176,20 @@ while ($line = [Console]::ReadLine()) {
         if process.lower() != "code" or not title:
             raise RuntimeError("Typing stopped because Windows VS Code lost focus. No further source text will be sent.")
 
+    def wait_until_focused(self) -> None:
+        announced = False
+        while True:
+            process, title = self.active().split("|", 1)
+            if process.lower() == "code" and title:
+                if announced:
+                    self.key("editor")
+                    print("VS Code is active again; resuming.")
+                return
+            if not announced:
+                print("Paused while another application is active. Return to VS Code to resume.")
+                announced = True
+            time.sleep(0.25)
+
     def wait_for_focus(self, timeout: float = 30) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -113,15 +200,53 @@ while ($line = [Console]::ReadLine()) {
             time.sleep(0.25)
         raise RuntimeError("Focus the Windows VS Code window within 30 seconds; no source text was typed.")
 
+    def wait_for_file_open(self, file_path: Path, timeout: float = 60) -> None:
+        expected = file_path.name.casefold()
+        deadline = time.monotonic() + timeout
+        consecutive_matches = 0
+        while time.monotonic() < deadline:
+            process, title = self.active().split("|", 1)
+            if process.casefold() == "code" and expected in title.casefold():
+                consecutive_matches += 1
+                if consecutive_matches >= 2:
+                    self.key("editor")
+                    time.sleep(0.5)  # Let VS Code finish creating and laying out the new editor tab.
+                    print(f"VS Code opened {file_path.name}; starting replay.")
+                    return
+            else:
+                consecutive_matches = 0
+            time.sleep(0.25)
+        raise RuntimeError(
+            f"VS Code did not show {file_path.name} as the active file within {timeout:.0f} seconds. "
+            "No source text was typed; bring the new file into view and retry."
+        )
+
     def type_text(self, text: str, delay_ms: int) -> None:
         import base64
-        self._request({"op": "type", "text": base64.b64encode(text.encode("utf-8")).decode("ascii"), "delay": delay_ms})
+        for character in text:
+            request = {"op": "type", "text": base64.b64encode(character.encode("utf-8")).decode("ascii"), "delay": delay_ms}
+            while True:
+                self.wait_until_focused()
+                if self._request(request) == "OK":
+                    break
 
     def key(self, name: str) -> None:
         self._request({"op": "key", "name": name})
 
+    def move_pointer(self) -> None:
+        self.wait_until_focused()
+        self._request({"op": "move"})
+
+    def safe_click(self) -> None:
+        self.wait_until_focused()
+        self._request({"op": "safe_click"})
+
     def close(self) -> None:
         if self.process.stdin:
+            try:
+                self._request({"op": "restore"})
+            except (OSError, RuntimeError):
+                pass
             self.process.stdin.close()
         try:
             self.process.wait(timeout=2)
@@ -245,9 +370,11 @@ def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None
     if is_wsl():
         if editor.name != "VS Code":
             raise RuntimeError("The Windows input bridge currently supports VS Code only; use --editor \"VS Code\".")
-        subprocess.Popen([shutil.which("code") or "code", "--reuse-window", str(file_to_open or Path(workspace))],
+        # Open/activate the workspace first. The destination file is opened in
+        # a separate, awaited step so typing cannot land in the previous tab.
+        subprocess.Popen([shutil.which("code") or "code", "--reuse-window", workspace],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        print("Opened the destination through the VS Code WSL command. Focus its Windows window to begin typing.")
+        print("Activated the VS Code workspace; waiting for the destination file before typing.")
         return "windows-vscode"
     window = window_for(editor)
     if window is None:
@@ -277,10 +404,14 @@ def launch_or_activate(editor: Editor, workspace: str, file_to_open: Path | None
     return window_id
 
 
-def open_file_in_editor(editor: Editor, file_path: Path) -> str:
+def open_file_in_editor(
+    editor: Editor, file_path: Path, windows_input: WindowsInput | None = None,
+) -> str:
     if is_wsl():
         subprocess.Popen([shutil.which("code") or "code", "--reuse-window", str(file_path)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        if windows_input:
+            windows_input.wait_for_file_open(file_path)
         return "windows-vscode"
     executable = next((shutil.which(command) for command in editor.commands if shutil.which(command)), None)
     if executable is None:
@@ -312,6 +443,7 @@ def replay_source(
     typo_chance: float, slowdown_factor: float,
     target_hours_per_10000_lines: float,
     windows_input: WindowsInput | None = None,
+    click_enabled: bool = False,
 ) -> None:
     """Type source text into the focused destination using xdotool keystrokes."""
     content = source.read_text(encoding="utf-8")
@@ -338,7 +470,7 @@ def replay_source(
     )
     for line_number, line in enumerate(lines):
         if windows_input:
-            windows_input.require_focus()
+            windows_input.wait_until_focused()
         else:
             require_editor_focus(window_id)
         # xdotool types literal text as simulated key events. Per-line calls keep
@@ -376,14 +508,14 @@ def replay_source(
                     subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", wrong], check=True)
                 time.sleep(random.uniform(0.12, 0.45) * pace * pace_scale)
                 if windows_input:
-                    windows_input.require_focus()
+                    windows_input.wait_until_focused()
                     windows_input.key("backspace")
                 else:
                     require_editor_focus(window_id)
                     subprocess.run(["xdotool", "key", "--window", window_id, "--clearmodifiers", "BackSpace"], check=True)
                 time.sleep(random.uniform(0.08, 0.3) * pace * pace_scale)
                 if windows_input:
-                    windows_input.require_focus()
+                    windows_input.wait_until_focused()
                     windows_input.type_text(correct, key_delay)
                 else:
                     require_editor_focus(window_id)
@@ -396,7 +528,7 @@ def replay_source(
                     subprocess.run(["xdotool", "type", "--window", window_id, "--clearmodifiers", "--delay", str(key_delay), "--", text[cursor:]], check=True)
         if line.endswith(("\n", "\r")):
             if windows_input:
-                windows_input.require_focus()
+                windows_input.wait_until_focused()
                 windows_input.key("enter")
             else:
                 require_editor_focus(window_id)
@@ -406,17 +538,52 @@ def replay_source(
                 pause += random.uniform(0.4, 1.2) * pace_scale
             if random.random() < thinking_pause_chance:
                 pause += random.uniform(1.0, 3.5) * pace_scale
-            # Move the pointer occasionally while the editor is idle between
-            # lines. This is limited to Linux/X11 because the Windows bridge
-            # intentionally exposes keyboard input only.
-            if not windows_input and random.random() < 0.18:
-                x, y = random_point(window_id)
-                subprocess.run(
-                    ["xdotool", "mousemove", "--sync", str(x), str(y)],
-                    stdout=subprocess.DEVNULL, check=False,
-                )
+            # Click only the Activity Bar, then restore editor focus. Never
+            # click inside code or the integrated terminal.
+            if click_enabled and random.random() < 0.035:
+                if windows_input:
+                    windows_input.safe_click()
+                else:
+                    x, y, _, height = window_geometry(window_id)
+                    click_x = x + 24
+                    click_y = y + random.randint(100, max(101, height - 80))
+                    subprocess.run(
+                        ["xdotool", "mousemove", "--sync", str(click_x), str(click_y), "click", "1"],
+                        stdout=subprocess.DEVNULL, check=False,
+                    )
+                    subprocess.run(
+                        ["xdotool", "key", "--window", window_id, "ctrl+1"],
+                        stdout=subprocess.DEVNULL, check=False,
+                    )
+            # Pointer movement is harmless without a click.
+            if random.random() < 0.18:
+                if windows_input:
+                    windows_input.move_pointer()
+                else:
+                    x, y = random_point(window_id)
+                    subprocess.run(
+                        ["xdotool", "mousemove", "--sync", str(x), str(y)],
+                        stdout=subprocess.DEVNULL, check=False,
+                    )
             time.sleep(pause)
     print(f"Finished typing {len(lines)} lines from {source}")
+    if windows_input:
+        windows_input.wait_until_focused()
+        windows_input.key("save")
+        time.sleep(1)
+        saved = destination.read_text(encoding="utf-8")
+        if saved != content:
+            mismatch = next(
+                (index for index, (expected, actual) in enumerate(zip(content, saved))
+                 if expected != actual),
+                min(len(content), len(saved)),
+            )
+            line = content.count("\n", 0, mismatch) + 1
+            raise RuntimeError(
+                f"Saved output differs from source at line {line}; refusing to report a successful replay. "
+                "Check that VS Code finished saving and that no extension changed the text."
+            )
+        print("Verified saved output matches the source exactly.")
 
 
 def random_point(window_id: str, margin: int = 36) -> tuple[int, int]:
@@ -440,13 +607,12 @@ def activity_session(
     destination = create_output_file(workspace, source, output_index) if source else None
     window_id = launch_or_activate(editor, workspace, destination)
     if source and destination:
-        window_id = open_file_in_editor(editor, destination)
-        if windows_input:
-            windows_input.wait_for_focus()
+        window_id = open_file_in_editor(editor, destination, windows_input)
         replay_source(
             source, destination, window_id, min_key_delay_ms, max_key_delay_ms,
             min_line_pause, max_line_pause, thinking_pause_chance,
             typo_chance, slowdown_factor, target_hours_per_10000_lines, windows_input,
+            click,
         )
         # Code replay is confined to the selected editor and exits immediately
         # after the source is typed. Do not move/click the pointer afterward.
@@ -460,7 +626,19 @@ def activity_session(
             stdout=subprocess.DEVNULL, check=False,
         )
         if click and random.random() < 0.12:
-            subprocess.run(["xdotool", "click", "1"], check=False)
+            # The activity bar is a narrow icon rail; do not click editor or
+            # terminal content. Restore the editor group after changing a view.
+            x, y, _, height = window_geometry(window_id)
+            click_x = x + 24
+            click_y = y + random.randint(100, max(101, height - 80))
+            subprocess.run(
+                ["xdotool", "mousemove", "--sync", str(click_x), str(click_y), "click", "1"],
+                stdout=subprocess.DEVNULL, check=False,
+            )
+            subprocess.run(
+                ["xdotool", "key", "--window", window_id, "ctrl+1"],
+                stdout=subprocess.DEVNULL, check=False,
+            )
         time.sleep(random.uniform(15, 55))
 
 
@@ -473,7 +651,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-break", type=int, default=1, help="Shortest pause between sessions in minutes (default: 1).")
     parser.add_argument("--max-break", type=int, default=5, help="Longest pause between sessions in minutes (default: 5).")
     parser.add_argument("--once", action="store_true", help="Run one session in each editor, then exit.")
-    parser.add_argument("--click", action="store_true", help="Enable occasional left clicks inside editor windows.")
+    parser.add_argument("--click", action="store_true", help="Enable occasional clicks on VS Code's Activity Bar, then restore editor focus.")
     parser.add_argument("--source", action="append", type=Path, default=[], help="Source code file to replay. Repeat this option to set file order.")
     parser.add_argument("--min-key-delay-ms", type=int, default=250, help="Minimum delay between simulated key events in milliseconds (default: 250).")
     parser.add_argument("--max-key-delay-ms", type=int, default=500, help="Maximum delay between simulated key events in milliseconds (default: 500).")
